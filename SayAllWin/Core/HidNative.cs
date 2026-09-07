@@ -154,7 +154,9 @@ public static class HidNative
                     Marshal.StructureToPtr(detail, buffer, false);
                     if (SetupDiGetDeviceInterfaceDetail(handle, ref ifData, buffer, required, out _, IntPtr.Zero))
                     {
-                        var pathPtr = IntPtr.Add(buffer, IntPtr.Size == 8 ? 8 : 6);
+                        // DevicePath（wchar 数组）紧跟 cbSize（uint，4 字节）之后：offset 4。
+                        // 此前按指针大小读 offset 8，导致路径丢失 "\\?\" 前缀（CreateFile 报 123）。
+                        var pathPtr = IntPtr.Add(buffer, 4);
                         var path = Marshal.PtrToStringUni(pathPtr);
                         if (!string.IsNullOrEmpty(path)) paths.Add(path);
                     }
@@ -174,11 +176,12 @@ public static class HidNative
 
     private const string VidPidPattern = "VID_2717&PID_32B8";
 
-    /// <summary>路径是否匹配 RC003（VID 0x2717 / PID 0x32B8）。</summary>
+    /// <summary>路径是否匹配 RC003。USB 枚举格式为 VID_2717&PID_32B8；BLE HOGP 枚举格式为 {00001812-…}_DEV_VID&012717_PID&32B8_REV&…。</summary>
     public static bool IsTargetDevicePath(string path)
     {
         var upper = path.ToUpperInvariant();
-        return upper.Contains(VidPidPattern) || upper.Contains("VID_2717") && upper.Contains("PID_32B8");
+        var vidOk = upper.Contains("VID_2717") || upper.Contains("VID&012717");
+        return vidOk && upper.Contains("32B8");
     }
 }
 
@@ -307,9 +310,10 @@ public sealed class KeyboardEventSuppressor : IDisposable
                 if ((data.flags & HidNative.LLKHF_INJECTED) == 0)
                 {
                     var vk = (ushort)data.vkCode;
-                    // 遥控器活跃期原生 F5 一律吞掉：系统按键路径早于 HID 报告回调，Arm 时序不可依赖（含首 down 竞态与 key-repeat）。
-                    // 钩子线程内不做任何 IO/日志；副作用是遥控器连接期物理键盘 F5 也被吞，刷新可用 Ctrl+R 替代（文档已注明）。
-                    if (vk == 0x74 && Environment.TickCount64 - _lastReportTickCount <= RemoteActiveWindowMs)
+                    // 遥控器活跃期：遥控器 keyboard 键位表内的原生事件一律吞掉（含首 down 竞态与 key-repeat），
+                    // 程序动作是唯一来源（对应 macOS 设备独占语义）。钩子线程内无 IO/日志，仅计数。
+                    // 副作用：活跃期（最近 30 秒内有遥控器操作）物理键盘同键位被吞，闲置 30 秒后恢复。
+                    if (IsRemoteControlledVk(vk) && Environment.TickCount64 - _lastReportTickCount <= RemoteActiveWindowMs)
                     {
                         Interlocked.Increment(ref _f5SwallowCount);
                         return new IntPtr(1);
@@ -324,6 +328,18 @@ public sealed class KeyboardEventSuppressor : IDisposable
         }
         return HidNative.CallNextHookEx(_hook, nCode, wParam, lParam);
     }
+
+    /// <summary>遥控器 keyboard page 键位对应的 VK（语音键 F5、方向、OK、Back、Home、Menu）。音量/电源等 consumer page 键不在 Raw Input 通道内，无需拦截。</summary>
+    private static bool IsRemoteControlledVk(ushort vk) => vk switch
+    {
+        0x74 /* F5 语音键 */ => true,
+        0x25 or 0x26 or 0x27 or 0x28 /* ← ↑ → ↓ */ => true,
+        0x0D /* Return=OK */ => true,
+        0x1B /* Esc=Back */ => true,
+        0x24 /* Home */ => true,
+        0x5D /* Application=Menu */ => true,
+        _ => false,
+    };
 
     private bool ShouldSuppress(ushort vk, int message)
     {
@@ -366,6 +382,226 @@ public sealed class KeyboardEventSuppressor : IDisposable
     public void Dispose() => Stop();
 }
 
+/// <summary>
+/// Raw Input 键盘监听：Windows 对键盘类 HID collection 强制独占（用户态 ReadFile 返回拒绝访问），
+/// 键盘事件唯一可编程通道是 Raw Input（RIDEV_INPUTSINK 后台接收，含设备句柄可区分来源）。
+/// 提供 (设备路径, 虚拟键, 按下/释放) 边沿事件，供按键映射与语音键驱动使用。
+/// </summary>
+public sealed class RawInputListener : IDisposable
+{
+    private const uint WM_INPUT = 0x00FF;
+    private const uint RIDEV_INPUTSINK = 0x00000100;
+    private const uint RID_INPUT = 0x10000003;
+    private const uint RIDI_DEVICENAME = 0x20000007;
+    private const int GWLP_WNDPROC = -4;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUTHEADER
+    {
+        public uint dwType;
+        public uint dwSize;
+        public IntPtr hDevice;
+        public IntPtr wParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWKEYBOARD
+    {
+        public ushort MakeCode;
+        public ushort Flags;
+        public ushort Reserved;
+        public ushort VKey;
+        public uint Message;
+        public IntPtr ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RAWINPUT_KBD
+    {
+        public RAWINPUTHEADER header;
+        public RAWKEYBOARD keyboard;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(IntPtr hRawInput, uint command, IntPtr pData, ref uint size, uint headerSize);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint GetRawInputDeviceInfoW(IntPtr hDevice, uint command, IntPtr pData, ref uint size);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateWindowExW(uint exStyle, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+
+    private delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowLongPtrW(IntPtr hwnd, int index, IntPtr newProc);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallWindowProcW(IntPtr prevProc, IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetMessageW(out HidNative.MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref HidNative.MSG msg);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessageW(ref HidNative.MSG msg);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private IntPtr _hwnd;
+    private IntPtr _prevProc = IntPtr.Zero;
+    private Thread? _thread;
+    private volatile bool _running;
+    private readonly Dictionary<IntPtr, string> _deviceNames = new();
+    private readonly WndProcDelegate _proc;
+
+    /// <summary>(设备接口路径, VK, 是否按下)。在监听线程回调。</summary>
+    public event Action<string, ushort, bool>? DeviceKey;
+
+    public RawInputListener()
+    {
+        _proc = WndProc;
+    }
+
+    public bool Start()
+    {
+        if (_running) return _hwnd != IntPtr.Zero;
+        _running = true;
+        var created = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _thread = new Thread(() =>
+        {
+            try
+            {
+                _hwnd = CreateWindowExW(0, "STATIC", "SayAllRawInput", 0, 0, 0, 0, 0,
+                    new IntPtr(-3) /* HWND_MESSAGE */, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (_hwnd == IntPtr.Zero) { created.TrySetResult(false); return; }
+                _prevProc = SetWindowLongPtrW(_hwnd, GWLP_WNDPROC, Marshal.GetFunctionPointerForDelegate(_proc));
+                var dev = new RAWINPUTDEVICE
+                {
+                    usUsagePage = 1, // Generic Desktop
+                    usUsage = 6,     // Keyboard
+                    dwFlags = RIDEV_INPUTSINK,
+                    hwndTarget = _hwnd,
+                };
+                var ok = RegisterRawInputDevices(new[] { dev }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+                created.TrySetResult(ok);
+                while (_running && GetMessageW(out HidNative.MSG msg, IntPtr.Zero, 0, 0))
+                {
+                    TranslateMessage(ref msg);
+                    DispatchMessageW(ref msg);
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Write("RAWINPUT exception=" + ex.GetType().Name + " msg=" + ex.Message);
+                created.TrySetResult(false);
+            }
+        })
+        { IsBackground = true, Name = "SayAllRawInput" };
+        _thread.Start();
+        try
+        {
+            return created.Task.Wait(2000) && created.Task.Result;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Dispose()
+    {
+        _running = false;
+        if (_hwnd != IntPtr.Zero)
+        {
+            PostMessageW(_hwnd, 0x0010 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero);
+        }
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        if (msg == WM_INPUT)
+        {
+            try { HandleRawInput(lParam); } catch { }
+        }
+        return _prevProc != IntPtr.Zero
+            ? CallWindowProcW(_prevProc, hwnd, msg, wParam, lParam)
+            : DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    private void HandleRawInput(IntPtr lParam)
+    {
+        var bufSize = (uint)(Marshal.SizeOf<RAWINPUTHEADER>() + Marshal.SizeOf<RAWKEYBOARD>());
+        var buf = Marshal.AllocHGlobal((int)bufSize);
+        try
+        {
+            var got = GetRawInputData(lParam, RID_INPUT, buf, ref bufSize, (uint)Marshal.SizeOf<RAWINPUTHEADER>());
+            if (got == unchecked((uint)-1)) return;
+            var raw = Marshal.PtrToStructure<RAWINPUT_KBD>(buf);
+            if (raw.header.dwType != 1 /* RIM_TYPEKEYBOARD */) return;
+            var k = raw.keyboard;
+            var down = (k.Flags & 0x01) == 0; // RI_KEY_BREAK
+            var vk = k.VKey;
+            if (vk == 0) return;
+            var name = DeviceNameFor(raw.header.hDevice);
+            if (name is null || !HidNative.IsTargetDevicePath(name)) return;
+            DeviceKey?.Invoke(name, vk, down);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    private string? DeviceNameFor(IntPtr hDevice)
+    {
+        if (hDevice == IntPtr.Zero) return null;
+        lock (_deviceNames)
+        {
+            if (_deviceNames.TryGetValue(hDevice, out var cached)) return cached;
+        }
+        var size = 0u;
+        _ = GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, IntPtr.Zero, ref size);
+        if (size == 0) return null;
+        var buf = Marshal.AllocHGlobal((int)size * 2);
+        try
+        {
+            if (GetRawInputDeviceInfoW(hDevice, RIDI_DEVICENAME, buf, ref size) == unchecked((uint)-1)) return null;
+            var name = Marshal.PtrToStringUni(buf);
+            if (name is not null)
+            {
+                lock (_deviceNames) { _deviceNames[hDevice] = name; }
+            }
+            return name;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+}
+
 /// <summary>设备生命周期：轮询 HID 接口枚举，报告新增/移除（对应 IOHID 匹配/移除回调）。</summary>
 public sealed class HidDeviceWatcher : IDisposable
 {
@@ -373,6 +609,8 @@ public sealed class HidDeviceWatcher : IDisposable
     private readonly object _gate = new();
     private readonly System.Threading.Timer _timer;
     private volatile bool _running;
+    private int _lastPollTotal = -1;
+    private int _lastMatched = -1;
 
     public event Action<string>? DeviceAdded;
     public event Action<string>? DeviceRemoved;
@@ -386,16 +624,23 @@ public sealed class HidDeviceWatcher : IDisposable
     private void Poll()
     {
         if (!_running) return;
+        List<string> all;
         List<string> current;
         try
         {
-            current = HidNative.EnumerateHidDevicePaths()
-                .Where(HidNative.IsTargetDevicePath)
-                .ToList();
+            all = HidNative.EnumerateHidDevicePaths();
+            current = all.Where(HidNative.IsTargetDevicePath).ToList();
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Write("HID POLL exception=" + ex.GetType().Name + " msg=" + ex.Message);
             return;
+        }
+        if (all.Count != _lastPollTotal || current.Count != _lastMatched)
+        {
+            _lastPollTotal = all.Count;
+            _lastMatched = current.Count;
+            AppLogger.Write("HID POLL total=" + all.Count + " matched=" + current.Count);
         }
         lock (_gate)
         {
@@ -412,6 +657,16 @@ public sealed class HidDeviceWatcher : IDisposable
                 try { DeviceRemoved?.Invoke(path); } catch { }
             }
         }
+    }
+
+    /// <summary>清空已知设备集并立即重扫：Start 订阅事件后调用，避免 watcher 早于订阅的发现事件被丢弃。</summary>
+    public void Rescan()
+    {
+        lock (_gate)
+        {
+            _known.Clear();
+        }
+        Poll();
     }
 
     public void Dispose()

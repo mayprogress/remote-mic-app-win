@@ -120,6 +120,9 @@ public sealed class HidRemoteMonitor : IDisposable
     private readonly RemoteButtonGestureRecognizer _gesture = new();
 
     private HashSet<ushort> _activeUsages = new();
+    private readonly HashSet<ushort> _rawActive = new();
+    private RawInputListener? _listener;
+    private bool _hidConnectedAnnounced;
     private string? _deviceFingerprint;
     private volatile bool _monitoring;
 
@@ -143,22 +146,26 @@ public sealed class HidRemoteMonitor : IDisposable
         _suppressor.Clear();
         var hookOk = _suppressor.Start();
         AppLogger.Write("HID HOOK installed ok=" + (hookOk ? "1" : "0"));
-        _watcher.DeviceAdded += OnDeviceAdded;
-        _watcher.DeviceRemoved += OnDeviceRemoved;
+        _listener = new RawInputListener();
+        _listener.DeviceKey += OnRawDeviceKey;
+        var rawOk = _listener.Start();
+        AppLogger.Write("RAWINPUT listener ok=" + (rawOk ? "1" : "0"));
         UpdateStatus("button_mapping.status.waiting_for_device");
         AppLogger.Write("HID START mode=adaptive windows");
     }
 
     public void Stop()
     {
-        _watcher.DeviceAdded -= OnDeviceAdded;
-        _watcher.DeviceRemoved -= OnDeviceRemoved;
+        _listener?.Dispose();
+        _listener = null;
         lock (_gate)
         {
             foreach (var reader in _readers.Values) reader.Dispose();
             _readers.Clear();
             _deviceFingerprint = null;
+            _rawActive.Clear();
         }
+        _hidConnectedAnnounced = false;
         CancelAllTimers();
         _suppressor.Stop();
         _suppressor.Clear();
@@ -167,60 +174,48 @@ public sealed class HidRemoteMonitor : IDisposable
         _monitoring = false;
     }
 
-    private void OnDeviceAdded(string path)
+    /// <summary>键盘 VK → HID 键盘 usage（仅覆盖遥控器 keyboard page 按键；音量/电源等 consumer page 键不在 Raw Input keyboard 通道内）。</summary>
+    private static ushort VkToUsage(ushort vk) => vk switch
     {
-        lock (_gate)
-        {
-            if (!_monitoring) return;
-            if (_readers.ContainsKey(path)) return;
-            var reader = new HidDeviceReader(path);
-            var error = reader.Open();
-            if (!string.IsNullOrEmpty(error))
-            {
-                AppLogger.Write($"HID DEVICE OPEN FAILED path={path} error={error}");
-                return;
-            }
-            reader.ReportReceived += OnReport;
-            _readers[path] = reader;
-            _deviceFingerprint ??= reader.Fingerprint;
-        }
-        UpdateStatus("button_mapping.status.connected");
-        AppLogger.Write("HID DEVICE connected fingerprint=" + Truncate(_deviceFingerprint));
-        try { DeviceConnected?.Invoke(_deviceFingerprint); } catch { }
-    }
+        0x74 => 0x3E, // F5 → 语音键
+        0x26 => 0x52, // ↑
+        0x25 => 0x51, // ←
+        0x27 => 0x53, // →
+        0x28 => 0x54, // ↓
+        0x0D => 0x58, // Return → OK
+        0x1B => 0x29, // Esc → Back
+        0x24 => 0x4A, // Home
+        0x5D => 0x65, // Application → Menu
+        _ => 0,
+    };
 
-    private void OnDeviceRemoved(string path)
+    private void OnRawDeviceKey(string path, ushort vk, bool down)
     {
-        lock (_gate)
-        {
-            if (_readers.Remove(path, out var reader))
-            {
-                reader.Dispose();
-            }
-            if (_readers.Count == 0)
-            {
-                _deviceFingerprint = null;
-                ResetInputState();
-                UpdateStatus("button_mapping.status.disconnected");
-                AppLogger.Write("HID DISCONNECTED");
-            }
-        }
-    }
-
-    private static string Truncate(string? s) =>
-        string.IsNullOrEmpty(s) ? "unknown" : (s.Length > 8 ? s[..8] : s) + "…";
-
-    private void OnReport(HidDeviceReader reader, byte reportID, byte[] data, int length)
-    {
-        var usages = RemoteButtons.Usages(reportID, data, 0, length);
-        if (usages is null)
-        {
-            AppLogger.Write("HID REPORT rejected reason=parse_failed bytes=" + length);
-            return;
-        }
-
-        // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器在会话期间持续吞掉（含 key-repeat）
+        if (!_monitoring) return;
+        if (!HidNative.IsTargetDevicePath(path)) return;
         _suppressor.NotifyRemoteReport();
+        if (!_hidConnectedAnnounced)
+        {
+            _hidConnectedAnnounced = true;
+            _deviceFingerprint ??= path;
+            UpdateStatus("button_mapping.status.connected");
+            AppLogger.Write("HID DEVICE connected source=rawinput fingerprint=" + Truncate(path));
+            try { DeviceConnected?.Invoke(_deviceFingerprint); } catch { }
+        }
+        var usage = VkToUsage(vk);
+        if (usage == 0) return;
+        HashSet<ushort> snapshot;
+        lock (_gate)
+        {
+            if (down) _rawActive.Add(usage); else _rawActive.Remove(usage);
+            snapshot = new HashSet<ushort>(_rawActive);
+        }
+        HandleUsages(snapshot);
+    }
+
+    private void HandleUsages(HashSet<ushort> usages)
+    {
+        // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器在会话期间持续吞掉（含 key-repeat）
         var voiceDown = usages.Contains(VoiceKeyUsage);
         var voiceWasDown = _activeUsages.Contains(VoiceKeyUsage);
         if (voiceDown && !voiceWasDown)
@@ -237,6 +232,9 @@ public sealed class HidRemoteMonitor : IDisposable
 
         Process(usages);
     }
+
+    private static string Truncate(string? s) =>
+        string.IsNullOrEmpty(s) ? "unknown" : (s.Length > 8 ? s[..8] : s) + "…";
 
     private void Process(HashSet<ushort> usages)
     {
