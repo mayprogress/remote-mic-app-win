@@ -316,10 +316,10 @@ public static class VoiceKeyModeHelper
     /// 语音会话期间注入�?Windows 虚拟键�?    /// fn �?F5（RC003 物理语音键）默认注入 F5 按住；Command �?�?对应 Ctrl�?    /// </summary>
     public static ushort InjectedVk(VoiceKeyMode mode) => mode switch
     {
-        VoiceKeyMode.Function => 0x74, // F5
+        VoiceKeyMode.Function => 0x7C, // F13（无系统副作用；原生 F5 由抑制器吞掉）
         VoiceKeyMode.LeftCommand => 0xA2, // LCtrl
         VoiceKeyMode.RightCommand => 0xA3, // RCtrl
-        _ => 0x74,
+        _ => 0x7C,
     };
 
     public static bool RequiresAccessibility(VoiceKeyMode mode) => mode != VoiceKeyMode.Function;

@@ -193,7 +193,7 @@ public sealed partial class AppState : IDisposable
             _fnTapArmed = true;
             _preRoll.Clear();
             // 开始点按：先让目标工具进入录音，再排空 pre-roll
-            KeyboardInjector.TapKey(0x74); // F5 点按（对应 Fn 开始点按）
+            KeyboardInjector.TapKey(0x7C); // F13 点按（对应 Fn 开始点按；F13 无系统副作用）
             FlushPreRoll();
         }
         else
@@ -208,7 +208,7 @@ public sealed partial class AppState : IDisposable
         {
             _fnTapArmed = false;
             FlushPreRoll();
-            AudioOutput.EndSessionAfterDraining(0.75, () => KeyboardInjector.TapKey(0x74));
+            AudioOutput.EndSessionAfterDraining(0.75, () => KeyboardInjector.TapKey(0x7C));
         }
         else
         {
