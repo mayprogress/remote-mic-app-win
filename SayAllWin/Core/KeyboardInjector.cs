@@ -75,12 +75,22 @@ public static class KeyboardInjector
         return true;
     }
 
-    /// <summary>语音会话期间按住/释放触发键（自 setVoiceKeyPressed 移植）。</summary>
+    /// <summary>语音会话期间按住/释放触发键（自 setVoiceKeyPressed 移植）。组合键按下按序、释放逆序。</summary>
     public static bool SetVoiceKeyPressed(VoiceKeyMode mode, bool isPressed)
     {
-        var vk = VoiceKeyModeHelper.InjectedVk(mode);
-        // Command 侧键：注入修饰键对应键位；Fn 默认注入 F13（浏览器等不响应 F13；遥控器物理键的原生 F5 由抑制器吞掉）。
-        return PostKeyState(vk, isPressed);
+        var vks = VoiceKeyModeHelper.InjectedVks(mode);
+        // Command 侧键注入修饰键；Fn 注入 F13（浏览器等不响应 F13）；CtrlWinHold 注入 Ctrl+Win（微信输入法"按住说话"）。
+        // 遥控器物理语音键的原生 F5 由抑制器吞掉。
+        var ok = true;
+        if (isPressed)
+        {
+            foreach (var vk in vks) ok &= PostKeyState(vk, true);
+        }
+        else
+        {
+            for (var i = vks.Length - 1; i >= 0; i--) ok &= PostKeyState(vks[i], false);
+        }
+        return ok;
     }
 
     /// <summary>模拟鼠标滚轮（对应 macOS scrollWheel）。</summary>

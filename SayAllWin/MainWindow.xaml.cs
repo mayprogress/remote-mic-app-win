@@ -228,12 +228,15 @@ public partial class MainWindow : Window
                 VoiceKeyModeCombo.Items.Add(L10n.T("connection.voice_key.mode.fn"));
                 VoiceKeyModeCombo.Items.Add(L10n.T("connection.voice_key.mode.left_command"));
                 VoiceKeyModeCombo.Items.Add(L10n.T("connection.voice_key.mode.right_command"));
+                VoiceKeyModeCombo.Items.Add(L10n.T("connection.voice_key.mode.ctrl_win"));
             }
             VoiceKeyModeCombo.SelectedIndex = _state.Settings.VoiceKeyMode switch
             {
                 VoiceKeyMode.Function => 0,
                 VoiceKeyMode.LeftCommand => 1,
-                _ => 2,
+                VoiceKeyMode.RightCommand => 2,
+                VoiceKeyMode.CtrlWinHold => 3,
+                _ => 0,
             };
         }
         finally
@@ -609,6 +612,7 @@ public partial class MainWindow : Window
         {
             1 => "left_command",
             2 => "right_command",
+            3 => "ctrl_win_hold",
             _ => "fn",
         };
         _state.Settings.Save();

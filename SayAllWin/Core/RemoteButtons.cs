@@ -300,6 +300,7 @@ public enum VoiceKeyMode
     Function,
     LeftCommand,
     RightCommand,
+    CtrlWinHold,
 }
 
 public static class VoiceKeyModeHelper
@@ -309,17 +310,20 @@ public static class VoiceKeyModeHelper
         "fn" => VoiceKeyMode.Function,
         "left_command" => VoiceKeyMode.LeftCommand,
         "right_command" => VoiceKeyMode.RightCommand,
+        "ctrl_win_hold" => VoiceKeyMode.CtrlWinHold,
         _ => VoiceKeyMode.Function,
     };
 
     /// <summary>
     /// 语音会话期间注入�?Windows 虚拟键�?    /// fn �?F5（RC003 物理语音键）默认注入 F5 按住；Command �?�?对应 Ctrl�?    /// </summary>
-    public static ushort InjectedVk(VoiceKeyMode mode) => mode switch
+    /// <summary>语音会话期间按住的注入键序列（按下按序、释放逆序）。fn → F13；CtrlWinHold → Ctrl+Win（微信输入法"按住说话"）。</summary>
+    public static ushort[] InjectedVks(VoiceKeyMode mode) => mode switch
     {
-        VoiceKeyMode.Function => 0x7C, // F13（无系统副作用；原生 F5 由抑制器吞掉）
-        VoiceKeyMode.LeftCommand => 0xA2, // LCtrl
-        VoiceKeyMode.RightCommand => 0xA3, // RCtrl
-        _ => 0x7C,
+        VoiceKeyMode.Function => [0x7C], // F13（无系统副作用；原生 F5 由抑制器吞掉）
+        VoiceKeyMode.LeftCommand => [0xA2], // LCtrl
+        VoiceKeyMode.RightCommand => [0xA3], // RCtrl
+        VoiceKeyMode.CtrlWinHold => [0xA2, 0x5B], // LCtrl + LWin
+        _ => [0x7C],
     };
 
     public static bool RequiresAccessibility(VoiceKeyMode mode) => mode != VoiceKeyMode.Function;
@@ -329,9 +333,10 @@ public static class VoiceKeyModeHelper
         VoiceKeyMode.Function => "fn",
         VoiceKeyMode.LeftCommand => "left_command",
         VoiceKeyMode.RightCommand => "right_command",
+        VoiceKeyMode.CtrlWinHold => "ctrl_win_hold",
         _ => "fn",
     };
 
     /// <summary>注入时是否需要同时执�?Fn 化（�?macOS 默认 fn 模式）；Windows 恒为软件注入�?/summary>
-    public static bool UsesHardwareMapping(VoiceKeyMode mode) => mode == VoiceKeyMode.Function;
+    public static bool UsesHardwareMapping(VoiceKeyMode mode) => mode is VoiceKeyMode.Function or VoiceKeyMode.CtrlWinHold;
 }

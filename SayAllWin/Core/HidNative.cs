@@ -189,6 +189,8 @@ public sealed class KeyboardEventSuppressor : IDisposable
     private readonly object _gate = new();
     private readonly Dictionary<ushort, DateTime> _armingTimes = new();
     private readonly HashSet<ushort> _pendingUp = new();
+    // 会话级抑制（语音键）：Arm(down) 起持续吞到 Arm(up)，覆盖系统 key-repeat；带超时保护防释放事件丢失后永久吞键。
+    private readonly Dictionary<ushort, DateTime> _sticky = new();
     private IntPtr _hook;
     private Thread? _thread;
     private volatile bool _running;
@@ -201,17 +203,19 @@ public sealed class KeyboardEventSuppressor : IDisposable
         _proc = HookCallback;
     }
 
-    /// <summary>目标应用应抑制的原生系统按键 → 遥控器按压/释放边沿。</summary>
-    public void Arm(ushort vk, bool isDown)
+    /// <summary>目标应用应抑制的原生系统按键 → 遥控器按压/释放边沿。sticky=true 时按住期间持续抑制（语音键会话语义）。</summary>
+    public void Arm(ushort vk, bool isDown, bool sticky = false)
     {
         lock (_gate)
         {
             if (isDown)
             {
+                if (sticky) _sticky[vk] = DateTime.UtcNow;
                 _armingTimes[vk] = DateTime.UtcNow;
             }
             else
             {
+                _sticky.Remove(vk);
                 // 释放事件通常紧随按下；记录为待抑制状态
                 _pendingUp.Add(vk);
                 _armingTimes[vk] = DateTime.UtcNow;
@@ -225,6 +229,7 @@ public sealed class KeyboardEventSuppressor : IDisposable
         {
             _armingTimes.Clear();
             _pendingUp.Clear();
+            _sticky.Clear();
         }
     }
 
@@ -286,6 +291,17 @@ public sealed class KeyboardEventSuppressor : IDisposable
         lock (_gate)
         {
             var isDown = message is HidNative.WM_KEYDOWN or HidNative.WM_SYSKEYDOWN;
+            if (_sticky.TryGetValue(vk, out var stickyAt))
+            {
+                // 语音键会话进行中：按住产生的 down/up（含系统 key-repeat）全部吞掉；
+                // 超时保护：释放事件丢失（蓝牙断连）时 65 秒后自动放行，避免永久吞键。
+                if (DateTime.UtcNow - stickyAt <= TimeSpan.FromSeconds(65))
+                {
+                    if (!isDown) _pendingUp.Add(vk);
+                    return true;
+                }
+                _sticky.Remove(vk);
+            }
             if (_pendingUp.Remove(vk) && !isDown)
             {
                 return true;

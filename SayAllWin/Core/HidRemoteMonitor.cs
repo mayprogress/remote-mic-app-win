@@ -217,13 +217,13 @@ public sealed class HidRemoteMonitor : IDisposable
             return;
         }
 
-        // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器吞掉
+        // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器在会话期间持续吞掉（含 key-repeat）
         var voiceDown = usages.Contains(VoiceKeyUsage);
         var voiceWasDown = _activeUsages.Contains(VoiceKeyUsage);
         if (voiceDown && !voiceWasDown)
         {
             _app.OnRemoteVoiceKeyPressed();
-            ArmSuppression(0x74 /* VK_F5 */, true);
+            ArmSuppression(0x74 /* VK_F5 */, true, sticky: true);
         }
         else if (!voiceDown && voiceWasDown)
         {
@@ -510,11 +510,11 @@ public sealed class HidRemoteMonitor : IDisposable
         if (vk is not null) ArmSuppression(vk.Value, isDown);
     }
 
-    private void ArmSuppression(ushort vk, bool isDown)
+    private void ArmSuppression(ushort vk, bool isDown, bool sticky = false)
     {
         // 语音键 F5 始终抑制（所有模式下语音键都用于语音）；其它键仅自定义映射开启时抑制
         if (vk != 0x74 && !_settings.CustomMappingEnabled) return;
-        _suppressor.Arm(vk, isDown);
+        _suppressor.Arm(vk, isDown, sticky);
     }
 
     public static ushort? NativeVkForButton(RemoteButton button) => button switch
