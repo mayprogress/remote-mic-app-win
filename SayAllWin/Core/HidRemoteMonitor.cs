@@ -141,6 +141,8 @@ public sealed class HidRemoteMonitor : IDisposable
             _monitoring = true;
         }
         _suppressor.Clear();
+        var hookOk = _suppressor.Start();
+        AppLogger.Write("HID HOOK installed ok=" + (hookOk ? "1" : "0"));
         _watcher.DeviceAdded += OnDeviceAdded;
         _watcher.DeviceRemoved += OnDeviceRemoved;
         UpdateStatus("button_mapping.status.waiting_for_device");
@@ -218,12 +220,14 @@ public sealed class HidRemoteMonitor : IDisposable
         }
 
         // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器在会话期间持续吞掉（含 key-repeat）
+        _suppressor.NotifyRemoteReport();
         var voiceDown = usages.Contains(VoiceKeyUsage);
         var voiceWasDown = _activeUsages.Contains(VoiceKeyUsage);
         if (voiceDown && !voiceWasDown)
         {
             _app.OnRemoteVoiceKeyPressed();
             ArmSuppression(0x74 /* VK_F5 */, true, sticky: true);
+            AppLogger.Write("HID VOICEKEY down f5_total=" + _suppressor.F5SwallowCount);
         }
         else if (!voiceDown && voiceWasDown)
         {

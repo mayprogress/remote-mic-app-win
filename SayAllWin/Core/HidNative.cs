@@ -1,5 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace SayAll.Core;
 
@@ -233,14 +235,32 @@ public sealed class KeyboardEventSuppressor : IDisposable
         }
     }
 
-    public void Start()
+    // 遥控器报告活跃窗口：最近收到遥控器 HID 报告后 30 秒内视为遥控器连接期，原生 F5 全程拦截。
+    // 背景：系统把遥控器语音键转换成 F5 的内核路径早于用户态 HID 报告回调，按 Arm 时序抑制存在天然竞态，首个 down 会泄漏。
+    private long _lastReportTickCount = long.MinValue;
+    private long _f5SwallowCount;
+    private const long RemoteActiveWindowMs = 30_000;
+
+    /// <summary>HID 报告线程调用：标记遥控器报告活跃（非钩子线程，无 IO）。</summary>
+    public void NotifyRemoteReport()
     {
-        if (_running) return;
+        _lastReportTickCount = Environment.TickCount64;
+    }
+
+    /// <summary>累计吞掉的原生 F5 事件数（诊断用）。</summary>
+    public long F5SwallowCount => Interlocked.Read(ref _f5SwallowCount);
+
+    /// <summary>启动钩子线程并安装低级键盘钩子；返回安装是否成功。</summary>
+    public bool Start()
+    {
+        if (_running) return _hook != IntPtr.Zero;
         _running = true;
+        var installed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _thread = new Thread(() =>
         {
             _hook = HidNative.SetWindowsHookExW(HidNative.WH_KEYBOARD_LL, _proc,
                 HidNative.GetModuleHandleW("SayAll.exe"), 0);
+            installed.TrySetResult(_hook != IntPtr.Zero);
             HidNative.MSG msg;
             while (_running && HidNative.GetMessageW(out msg, IntPtr.Zero, 0, 0))
             {
@@ -253,6 +273,14 @@ public sealed class KeyboardEventSuppressor : IDisposable
         })
         { IsBackground = true, Name = "SayAllKeyHook" };
         _thread.Start();
+        try
+        {
+            return installed.Task.Wait(2000) && installed.Task.Result;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public void Stop()
@@ -276,10 +304,21 @@ public sealed class KeyboardEventSuppressor : IDisposable
                 or HidNative.WM_SYSKEYDOWN or HidNative.WM_SYSKEYUP)
             {
                 var data = Marshal.PtrToStructure<HidNative.KBDLLHOOKSTRUCT>(lParam);
-                if ((data.flags & HidNative.LLKHF_INJECTED) == 0 && ShouldSuppress((ushort)data.vkCode, message))
+                if ((data.flags & HidNative.LLKHF_INJECTED) == 0)
                 {
-                    // 吞掉该事件，避免与注入动作重复
-                    return new IntPtr(1);
+                    var vk = (ushort)data.vkCode;
+                    // 遥控器活跃期原生 F5 一律吞掉：系统按键路径早于 HID 报告回调，Arm 时序不可依赖（含首 down 竞态与 key-repeat）。
+                    // 钩子线程内不做任何 IO/日志；副作用是遥控器连接期物理键盘 F5 也被吞，刷新可用 Ctrl+R 替代（文档已注明）。
+                    if (vk == 0x74 && Environment.TickCount64 - _lastReportTickCount <= RemoteActiveWindowMs)
+                    {
+                        Interlocked.Increment(ref _f5SwallowCount);
+                        return new IntPtr(1);
+                    }
+                    if (ShouldSuppress(vk, message))
+                    {
+                        // 吞掉该事件，避免与注入动作重复
+                        return new IntPtr(1);
+                    }
                 }
             }
         }
