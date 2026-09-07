@@ -236,22 +236,25 @@ public sealed class XiaomiBluetoothBridge
         try
         {
             var devices = await DeviceInformation.FindAllAsync(BluetoothLEDevice.GetDeviceSelector());
+            var matched = 0;
+            var pairedSeen = false;
             foreach (var info in devices)
             {
                 if (!IsCurrentGeneration(generation) || _device is not null) return;
-                var name = info.Name;
-                if (!XiaomiVoiceRemoteNameMatcher.Matches(name)) continue;
-                if (info.Pairing.IsPaired)
-                {
-                    // DeviceInformation.Id 是字符串，需要先解析出真实蓝牙地址
-                    var resolved = await BluetoothLEDevice.FromIdAsync(info.Id);
-                    if (resolved is null) continue;
-                    var address = resolved.BluetoothAddress;
-                    resolved.Dispose();
-                    await TryConnect(address, generation, source: "paired_device", usesCachedTarget: false);
-                    return;
-                }
+                if (!XiaomiVoiceRemoteNameMatcher.Matches(info.Name)) continue;
+                matched += 1;
+                if (info.Pairing.IsPaired) pairedSeen = true;
+                // 真机实测：部分 HID-over-GATT 配对路径下 WinRT 的 Pairing.IsPaired 可能为 false，
+                // 名称白名单命中即尝试连接，不把配对标志作为硬性条件（白名单本身即安全边界）。
+                // DeviceInformation.Id 是字符串，需要先解析出真实蓝牙地址
+                var resolved = await BluetoothLEDevice.FromIdAsync(info.Id);
+                if (resolved is null) continue;
+                var address = resolved.BluetoothAddress;
+                resolved.Dispose();
+                await TryConnect(address, generation, source: "paired_device", usesCachedTarget: false);
+                return;
             }
+            AppLogger.Write($"BLE PAIRED probe done matched={matched} paired_present={(pairedSeen ? 1 : 0)}");
         }
         catch (Exception ex)
         {
@@ -385,7 +388,7 @@ public sealed class XiaomiBluetoothBridge
             }
 
             // 电池与型号（可选服务）
-            var batteryService = servicesResult.Services.FirstOrDefault(s => s.Uuid == Guid.Parse("180F"));
+            var batteryService = servicesResult.Services.FirstOrDefault(s => s.Uuid == Guid.Parse("0000180F-0000-1000-8000-00805F9B34FB"));
             if (batteryService is not null)
             {
                 try
@@ -393,19 +396,19 @@ public sealed class XiaomiBluetoothBridge
                     var batteryChars = await batteryService.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
                     foreach (var c in batteryChars.Characteristics)
                     {
-                        if (c.Uuid == Guid.Parse("2A19")) { _batteryLevel = c; await ReadBattery(c); await SubscribeNotify(c); }
-                        else if (c.Uuid == Guid.Parse("2BED")) { _batteryStatus = c; await ReadBatteryStatus(c); await SubscribeNotify(c); }
+                        if (c.Uuid == Guid.Parse("00002A19-0000-1000-8000-00805F9B34FB")) { _batteryLevel = c; await ReadBattery(c); await SubscribeNotify(c); }
+                        else if (c.Uuid == Guid.Parse("00002BED-0000-1000-8000-00805F9B34FB")) { _batteryStatus = c; await ReadBatteryStatus(c); await SubscribeNotify(c); }
                     }
                 }
                 catch { /* 可选服务失败不阻断 */ }
             }
-            var infoService = servicesResult.Services.FirstOrDefault(s => s.Uuid == Guid.Parse("180A"));
+            var infoService = servicesResult.Services.FirstOrDefault(s => s.Uuid == Guid.Parse("0000180A-0000-1000-8000-00805F9B34FB"));
             if (infoService is not null)
             {
                 try
                 {
                     var modelChars = await infoService.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
-                    var model = modelChars.Characteristics.FirstOrDefault(c => c.Uuid == Guid.Parse("2A24"));
+                    var model = modelChars.Characteristics.FirstOrDefault(c => c.Uuid == Guid.Parse("00002A24-0000-1000-8000-00805F9B34FB"));
                     if (model is not null) { _modelNumber = model; await ReadModel(model); }
                 }
                 catch { }
