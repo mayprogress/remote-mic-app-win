@@ -227,6 +227,10 @@ public sealed class VirtualAudioOutput : IDisposable
     private uint _bufferFrames;
     private volatile bool _running;
     private long _pendingSamples;
+    private int _mixChannels = 2;
+    private int _mixRate = 48000;
+    private int _mixBits = 32;
+
     private string _statusKey = "connection.audio.none_selected";
     private string? _statusArg;
 
@@ -279,31 +283,68 @@ public sealed class VirtualAudioOutput : IDisposable
         try
         {
             var enumerator = (AudioNative.IMMDeviceEnumerator)new AudioNative.MMDeviceEnumeratorComObject();
-            if (enumerator.GetDevice(device.Id, out var endpoint) != 0)
+            int hrGet = enumerator.GetDevice(device.Id, out var endpoint);
+            if (hrGet != 0)
             {
                 _statusKey = "connection.audio.selected_unavailable";
+                AppLogger.Write($"AUDIO CONFIGURE failed reason=get_device hr=0x{hrGet:X8}");
                 return false;
             }
             var client = ActivateAudioClient(endpoint);
             if (client is null)
             {
                 _statusKey = "connection.audio.core_audio_open_failed";
+                AppLogger.Write("AUDIO CONFIGURE failed reason=activate_failed");
                 return false;
             }
-            if (client.Initialize(0 /* shared */, AudioNative.AUDCLNT_STREAMFLAGS_NOPERSIST,
-                    0, 0, IntPtr.Zero, Guid.Empty) != 0)
+            // 共享模式 Initialize 必须传入混合格式指针（实测 pFormat=null 返回 E_POINTER）
+            int hrMix = client.GetMixFormat(out var fmtPtr);
+            if (hrMix != 0 || fmtPtr == IntPtr.Zero)
             {
                 _statusKey = "connection.audio.select_failed";
                 Marshal.FinalReleaseComObject(client);
+                AppLogger.Write($"AUDIO CONFIGURE failed reason=mix_format hr=0x{hrMix:X8}");
                 return false;
             }
-            client.GetBufferSize(out var bufferFrames);
+            var mix = Marshal.PtrToStructure<AudioNative.WAVEFORMATEX>(fmtPtr);
+            int mixChannels = mix.nChannels;
+            int mixRate = (int)mix.nSamplesPerSec;
+            int mixBits = mix.wBitsPerSample;
+            if (mixChannels < 1 || (mixBits != 32 && mixBits != 16))
+            {
+                Marshal.FreeCoTaskMem(fmtPtr);
+                Marshal.FinalReleaseComObject(client);
+                _statusKey = "connection.audio.select_failed";
+                AppLogger.Write($"AUDIO CONFIGURE failed reason=unsupported_mix ch={mixChannels} rate={mixRate} bits={mixBits}");
+                return false;
+            }
+            int hrInit = client.Initialize(0 /* shared */, AudioNative.AUDCLNT_STREAMFLAGS_NOPERSIST,
+                    0, 0, fmtPtr, Guid.Empty);
+            Marshal.FreeCoTaskMem(fmtPtr);
+            if (hrInit != 0)
+            {
+                _statusKey = "connection.audio.select_failed";
+                Marshal.FinalReleaseComObject(client);
+                AppLogger.Write($"AUDIO CONFIGURE failed reason=initialize hr=0x{hrInit:X8}");
+                return false;
+            }
+            // 不 Start() 渲染客户端，写入的缓冲不会被端点消费
+            int hrStart = client.Start();
+            if (hrStart != 0)
+            {
+                _statusKey = "connection.audio.select_failed";
+                Marshal.FinalReleaseComObject(client);
+                AppLogger.Write($"AUDIO CONFIGURE failed reason=start hr=0x{hrStart:X8}");
+                return false;
+            }
             if (client.GetService(ref AudioNative.IID_IAudioRenderClient, out var renderPtr) != 0)
             {
                 _statusKey = "connection.audio.select_failed";
                 Marshal.FinalReleaseComObject(client);
+                AppLogger.Write("AUDIO CONFIGURE failed reason=render_client");
                 return false;
             }
+            client.GetBufferSize(out var bufferFrames);
 
             lock (_gate)
             {
@@ -311,6 +352,9 @@ public sealed class VirtualAudioOutput : IDisposable
                 _client = client;
                 _render = (AudioNative.IAudioRenderClient)Marshal.GetObjectForIUnknown(renderPtr);
                 _bufferFrames = bufferFrames;
+                _mixChannels = mixChannels;
+                _mixRate = mixRate;
+                _mixBits = mixBits;
                 SelectedDevice = device;
             }
 
@@ -346,6 +390,7 @@ public sealed class VirtualAudioOutput : IDisposable
 
     private void WriterLoop(CancellationToken ct)
     {
+        const int inRate = 16000;
         while (!ct.IsCancellationRequested)
         {
             short[]? chunk = null;
@@ -359,32 +404,60 @@ public sealed class VirtualAudioOutput : IDisposable
                 continue;
             }
 
-            // 推送模型：等到端点有足够可用帧再写入；共享模式由系统重采样。
+            // 推送模型：按端点混合格式分块写入。
+            // 输入是 16 kHz 单声道 PCM16；端点是 mix format（如 48 kHz 立体声 float32），
+            // 这里做线性插值重采样并展开到全部声道，帧数按端点采样率换算。
             try
             {
-                while (!ct.IsCancellationRequested)
+                int mixRate, mixChannels, mixBits;
+                lock (_gate) { mixRate = _mixRate; mixChannels = _mixChannels; mixBits = _mixBits; }
+                int offset = 0;
+                while (!ct.IsCancellationRequested && offset < chunk.Length)
                 {
                     _client!.GetCurrentPadding(out var padding);
                     var available = _bufferFrames - padding;
-                    if (available >= chunk.Length)
+                    // 留 2 帧插值余量；换算为可写入的输入样本数
+                    int maxIn = (int)((available - 2) * (double)inRate / mixRate);
+                    if (maxIn <= 0) { Thread.Sleep(5); continue; }
+                    int n = Math.Min(maxIn, chunk.Length - offset);
+                    int outFrames = (int)Math.Ceiling(n * (double)mixRate / inRate);
+                    _render!.GetBuffer((uint)outFrames, out var ptr);
+                    unsafe
                     {
-                        _render!.GetBuffer((uint)chunk.Length, out var ptr);
-                        unsafe
+                        double step = (double)inRate / mixRate;
+                        if (mixBits == 32)
                         {
                             var dest = (float*)ptr;
-                            for (var i = 0; i < chunk.Length; i++)
+                            for (var o = 0; o < outFrames; o++)
                             {
-                                dest[i] = chunk[i] * InvShortMax;
+                                var pos = offset + o * step;
+                                var i0 = (int)pos;
+                                var i1 = Math.Min(i0 + 1, chunk.Length - 1);
+                                var frac = pos - i0;
+                                var v = (float)((chunk[i0] * (1 - frac) + chunk[i1] * frac) * InvShortMax);
+                                for (var c = 0; c < mixChannels; c++) dest[o * mixChannels + c] = v;
                             }
                         }
-                        _render!.ReleaseBuffer((uint)chunk.Length, 0);
-                        lock (_gate)
+                        else
                         {
-                            _pendingSamples = Math.Max(0, _pendingSamples - chunk.Length);
+                            var dest = (short*)ptr;
+                            for (var o = 0; o < outFrames; o++)
+                            {
+                                var pos = offset + o * step;
+                                var i0 = (int)pos;
+                                var i1 = Math.Min(i0 + 1, chunk.Length - 1);
+                                var frac = pos - i0;
+                                var v = (short)(chunk[i0] * (1 - frac) + chunk[i1] * frac);
+                                for (var c = 0; c < mixChannels; c++) dest[o * mixChannels + c] = v;
+                            }
                         }
-                        break;
                     }
-                    Thread.Sleep(5);
+                    _render!.ReleaseBuffer((uint)outFrames, 0);
+                    offset += n;
+                    lock (_gate)
+                    {
+                        _pendingSamples = Math.Max(0, _pendingSamples - n);
+                    }
                 }
             }
             catch

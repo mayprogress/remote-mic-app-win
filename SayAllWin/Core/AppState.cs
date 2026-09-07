@@ -113,9 +113,12 @@ public sealed partial class AppState : IDisposable
     {
         if (_voiceSessionActive)
         {
+            AppLogger.Write("AUDIO TESTTONE rejected reason=voice_session_active");
             return false;
         }
-        return AudioOutput.PlayTestTone();
+        var ok = AudioOutput.PlayTestTone();
+        AppLogger.Write("AUDIO TESTTONE " + (ok ? "queued" : "rejected reason=inactive"));
+        return ok;
     }
 
     // ---------------- 语音会话 ----------------
