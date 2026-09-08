@@ -243,6 +243,10 @@ public sealed class KeyboardEventSuppressor : IDisposable
     private long _lastReportTickCount = long.MinValue;
     private long _f5SwallowCount;
     private const long RemoteActiveWindowMs = 30_000;
+    private Action<bool>? _hookedVoice;
+
+    /// <summary>注册钩子语音边沿处理器。钩子线程内只调用此委托（实现必须非阻塞，仅做投递）。</summary>
+    public void SetHookedVoiceHandler(Action<bool> handler) => _hookedVoice = handler;
 
     /// <summary>HID 报告线程调用：标记遥控器报告活跃（非钩子线程，无 IO）。</summary>
     public void NotifyRemoteReport()
@@ -310,10 +314,17 @@ public sealed class KeyboardEventSuppressor : IDisposable
                 if ((data.flags & HidNative.LLKHF_INJECTED) == 0)
                 {
                     // 实测结论：LL 钩子只能吞掉或放行事件，修改 KBDLLHOOKSTRUCT 不影响系统处理（改写 F5→F13 无效已验证）。
-                    // F5 的系统级消除由 Scancode Map（HKLM …\Keyboard Layout，scan 0x3E→0x64=F13，重启生效）完成：
-                    // 系统从底层收到的就是 F13，Raw Input 收到同一事件且保留真实来源设备标识，
-                    // 按键映射按设备路径区分遥控器（→语音键）与物理键盘（→忽略）。
-                    // 该钩子仅保留 Arm 窗口抑制（自定义映射场景的注入去重）。
+                    // 方案对齐 vibe-flow 实测架构：钩子吞掉 F5（VK 0x74，含蓝牙重连后扫描码漂移形态），
+                    // 阻止系统刷新等快捷键效果；钩子线程内只做投递（线程池），语音边沿由池线程驱动状态机；
+                    // Raw Input（设备过滤后）调用同一状态机，双源幂等去重。物理键盘 F5 因此失效（Ctrl+R 替代刷新），
+                    // 方向/OK/Back/Home/Menu 不吞，由设备域 Raw Input 执行。
+                    if (data.vkCode == 0x74)
+                    {
+                        var isDown = message is HidNative.WM_KEYDOWN or HidNative.WM_SYSKEYDOWN;
+                        Interlocked.Increment(ref _f5SwallowCount);
+                        _hookedVoice?.Invoke(isDown);
+                        return new IntPtr(1);
+                    }
                     if (ShouldSuppress((ushort)data.vkCode, message))
                     {
                         return new IntPtr(1);

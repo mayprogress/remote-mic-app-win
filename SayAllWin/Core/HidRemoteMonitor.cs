@@ -144,6 +144,9 @@ public sealed class HidRemoteMonitor : IDisposable
             _monitoring = true;
         }
         _suppressor.Clear();
+        // 钩子吞掉 F5 后直接投递语音边沿（线程池线程执行）；Raw Input 是设备过滤后的第二来源，
+        // 两者共用 _rawActive/HandleUsages 幂等状态机，重复边沿被 voiceWasDown 保护去重。
+        _suppressor.SetHookedVoiceHandler(down => ThreadPool.QueueUserWorkItem(_ => HandleHookedVoiceKey(down)));
         var hookOk = _suppressor.Start();
         AppLogger.Write("HID HOOK installed ok=" + (hookOk ? "1" : "0"));
         _listener = new RawInputListener();
@@ -178,8 +181,8 @@ public sealed class HidRemoteMonitor : IDisposable
     /// 0x7C(F13) 是 LL 钩子把遥控器语音键原生 F5 原地改写后的键，保留真实设备标识，Raw Input 据此驱动语音键。</summary>
     private static ushort VkToUsage(ushort vk) => vk switch
     {
-        0x74 => 0x3E, // F5 → 语音键（未被钩子改写的路径）
-        0x7C => 0x3E, // F13 → 语音键（钩子改写后的遥控器语音键信号）
+        0x74 => 0x3E, // F5 → 语音键（钩子失效时的 Raw Input 兜底路径；钩子健康时 F5 已被吞，不产生 Raw Input）
+        0x7C => 0x3E, // F13 → 语音键（vibe-flow 式 Scancode Map 变形后的形态，兼容保留）
         0x26 => 0x52, // ↑
         0x25 => 0x51, // ←
         0x27 => 0x53, // →
@@ -190,6 +193,19 @@ public sealed class HidRemoteMonitor : IDisposable
         0x5D => 0x65, // Application → Menu
         _ => 0,
     };
+
+    /// <summary>钩子吞掉 F5 后投递的语音边沿（池线程）。与 Raw Input 来源共用状态机，幂等去重。</summary>
+    private void HandleHookedVoiceKey(bool down)
+    {
+        if (!_monitoring) return;
+        HashSet<ushort> snapshot;
+        lock (_gate)
+        {
+            if (down) _rawActive.Add(0x3E); else _rawActive.Remove(0x3E);
+            snapshot = new HashSet<ushort>(_rawActive);
+        }
+        HandleUsages(snapshot);
+    }
 
     private void OnRawDeviceKey(string path, ushort vk, bool down)
     {

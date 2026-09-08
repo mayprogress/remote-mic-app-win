@@ -40,10 +40,14 @@ public static class KeyboardInjector
     private const uint INPUT_KEYBOARD = 1;
     private const uint INPUT_MOUSE = 0;
     private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_SCANCODE = 0x0008;
     private const uint MOUSEEVENTF_WHEEL = 0x0800;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, NativeInput[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    private static extern uint MapVirtualKeyW(uint vk, uint type);
 
     /// <summary>注入单个键盘事件（down/up）。</summary>
     public static bool PostKeyState(ushort vk, bool isPressed)
@@ -54,6 +58,37 @@ public static class KeyboardInjector
             wVk = vk,
             kbFlags = isPressed ? 0 : KEYEVENTF_KEYUP,
         };
+        return SendInput(1, [input], Marshal.SizeOf<NativeInput>()) == 1;
+    }
+
+    /// <summary>
+    /// 扫描码层注入（对齐 vibe-flow 实测方案）：部分输入法（如微信输入法）不响应纯 VK 注入，
+    /// 需要以 KEYEVENTF_SCANCODE 携带 MapVirtualKey 换算的扫描码；换算失败时回退 VK 注入。
+    /// </summary>
+    public static bool PostKeyStateScan(ushort vk, bool isPressed)
+    {
+        var scan = MapVirtualKeyW(vk, 0 /* MAPVK_VK_TO_VSC */);
+        var flags = isPressed ? 0u : KEYEVENTF_KEYUP;
+        NativeInput input;
+        if (scan != 0)
+        {
+            input = new NativeInput
+            {
+                type = INPUT_KEYBOARD,
+                wVk = 0,
+                wScan = (ushort)scan,
+                kbFlags = flags | KEYEVENTF_SCANCODE,
+            };
+        }
+        else
+        {
+            input = new NativeInput
+            {
+                type = INPUT_KEYBOARD,
+                wVk = vk,
+                kbFlags = flags,
+            };
+        }
         return SendInput(1, [input], Marshal.SizeOf<NativeInput>()) == 1;
     }
 
@@ -80,16 +115,17 @@ public static class KeyboardInjector
     {
         var vks = VoiceKeyModeHelper.InjectedVks(mode);
         // Command 侧键注入修饰键；Fn 注入 F13（浏览器等不响应 F13）；CtrlWinHold 注入 Ctrl+Win（微信输入法"按住说话"）。
-        // 遥控器物理语音键的原生 F5 由抑制器吞掉。
+        // 注入采用扫描码层（vibe-flow 实测：部分输入法不响应纯 VK 注入）。
         var ok = true;
         if (isPressed)
         {
-            foreach (var vk in vks) ok &= PostKeyState(vk, true);
+            foreach (var vk in vks) ok &= PostKeyStateScan(vk, true);
         }
         else
         {
-            for (var i = vks.Length - 1; i >= 0; i--) ok &= PostKeyState(vks[i], false);
+            for (var i = vks.Length - 1; i >= 0; i--) ok &= PostKeyStateScan(vks[i], false);
         }
+        AppLogger.Write("INJECT voice mode=" + mode + " down=" + isPressed + " ok=" + ok + " vks=" + string.Join(",", vks));
         return ok;
     }
 

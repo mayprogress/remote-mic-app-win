@@ -31,8 +31,8 @@
 - **报告源切换 Raw Input**：新增 `RawInputListener`（`RegisterRawInputDevices` UsagePage=1/Usage=6 + `RIDEV_INPUTSINK`，message-only 窗口收 `WM_INPUT`，`GetRawInputData` 取 `RAWKEYBOARD`，`GetRawInputDeviceInfo(RIDI_DEVICENAME)` 缓存设备路径并按目标 VID/PID 过滤）。Windows 键盘事件唯一可编程通道即 Raw Input；`HidDeviceReader`（ReadFile 线程）保留但不再接线。`VkToUsage` 做 VK→HID usage 转换（F5↔0x3E 语音键、方向、Return=OK、Esc=Back、Home、Menu）；音量/电源等 consumer page 键不在 keyboard 通道内，保持系统直通。
 - **活跃期键位表拦截（已按用户要求撤销）**：方向/OK/Back/Home/Menu 不再锁定；F5 冲突改由 Scancode Map 系统级解决（见下）。`ShouldSuppress`（Arm 窗口）仅保留给自定义映射开启时的注入去重。
 - **Raw Input 通道实机确认（2026-09-08）**：按住语音键产生 `RAWINPUT vk=0x74 down=1 dev=\\?\HID#{00001812-…}`（30ms 间隔 key-repeat）→ `HID VOICEKEY down`，松开 `down=0`；物理键盘（VID_1A81）回车事件被 `not_target` 正确过滤。设备区分链路完全成立。
-- **Scancode Map 终案**：`HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout` 写入 `Scancode Map`（REG_BINARY，1 个映射对：scan 0x3E→0x64，即 F5→F13），**重启后生效**。系统键盘栈从底层收到的语音键就是 F13（无任何快捷键语义），Raw Input 收到同一事件且保留真实设备标识：遥控器 F13 → 语音键（`VkToUsage(0x7C)=0x3E`），物理键盘 F5（变形后的 F13）→ 设备过滤忽略。方向/OK/Back/Home/Menu 等其他按键完全不受影响。写入由设置页/引导提权完成（一次性 UAC），删除该注册表值并重启即可还原。
-- **代价（用户已确认接受"只锁定 F5"）**：物理键盘 F5 全局失效（所有键盘的 F5 都变形为 F13），浏览器刷新用 Ctrl+R 替代；重启前过渡期 F5 仍会触发刷新。
+- **Scancode Map 尝试（已撤销）**：曾写入 scan 0x3E→0x64，实机验证未生效——0x3E 是 F4 的 set 1 扫描码（F5 应为 0x3F，vibe-flow 源码确认），且 BLE HID 重连会出现扫描码漂移/缺失，该机制对 RC003 不可靠；错误映射已从注册表删除。
+- **最终方案（对齐本机 vibe-flow 实测架构）**：LL 钩子吞掉 F5（VK 0x74，不依赖扫描码）阻止系统快捷键效果，钩子线程内仅投递（线程池），池线程驱动语音状态机；Raw Input（设备过滤后）作为第二来源调用同一 `_rawActive`/`HandleUsages` 幂等状态机，重复边沿由 voiceWasDown 保护去重（钩子健康时事件被吞、Raw Input 收不到，天然单源；钩子失效时 Raw Input 兜底）。物理键盘 F5 因此失效（Ctrl+R 替代刷新），方向/OK/Back/Home/Menu 不吞、由设备域 Raw Input 执行。注入改用扫描码层（`KEYEVENTF_SCANCODE` + `MapVirtualKey`，对齐 vibe-flow `useScanCode=true`）：部分输入法（微信输入法）不响应纯 VK 注入。
 - 诊断日志：`HID POLL total= matched=`（设备总数变化时）、`RAWINPUT vk= down= dev=`（关注键位）、`HID DEVICE connected source=rawinput fingerprint=…`、`HID VOICEKEY down`、`RAWINPUT listener ok=<0|1>`。
 
 ## 验证
