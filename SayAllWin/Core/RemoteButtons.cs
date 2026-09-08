@@ -145,7 +145,13 @@ public static class RemoteButtons
             : null;
 
     public static RemoteButton? FromUsage(ushort usage) =>
-        Enum.IsDefined(typeof(RemoteButton), usage) ? (RemoteButton)usage : null;
+        // RemoteButton 底层类型是 byte：Enum.IsDefined 传入 ushort 装箱会抛 ArgumentException
+        // （"Enum underlying type and the object must be same type"），导致所有按键在
+        // usage→button 转换处静默失效（异常被 Raw Input 消息循环吞掉，无日志时不可见）。
+        // 必须先转 byte 再判定。
+        usage <= byte.MaxValue && Enum.IsDefined(typeof(RemoteButton), (byte)usage)
+            ? (RemoteButton)usage
+            : null;
 }
 
 /// <summary>HID 时序常量（自 HIDRemoteTiming 移植）�?/summary>

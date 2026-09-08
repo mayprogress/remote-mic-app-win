@@ -181,14 +181,22 @@ public sealed class HidRemoteMonitor : IDisposable
     /// 0x7C(F13) 是 LL 钩子把遥控器语音键原生 F5 原地改写后的键，保留真实设备标识，Raw Input 据此驱动语音键。</summary>
     private static ushort VkToUsage(ushort vk) => vk switch
     {
-        0x74 => 0x3E, // F5 → 语音键（钩子失效时的 Raw Input 兜底路径；钩子健康时 F5 已被吞，不产生 Raw Input）
+        // usage 值必须与 RemoteButton 枚举（macOS 原版实测的 RC003 用法）一致：
+        // Ok=0x28、Back=0xF1、Left=0x50、Down=0x51、Up=0x52、Right=0x4F、Home=0x4A、Menu=0x65。
+        // 注意 RC003 的 usage 与 USB 标准键盘页不同（Right=0x4F、Back=0xF1 为厂商用法），
+        // Windows 只能通过 VK 反推；0xDB(VK_OEM_4) 是 usage 0x4F 的 Windows 翻译形态，
+        // 0xFF 是未知 usage（RC003 Back 的实测形态，见 vibe-flow 0xFF+scan 0x5E 记录）。
+        // 物理键盘的 VK_OEM_4 会被设备过滤丢弃，不会误触。
+        0x74 => 0x3E, // F5 → 语音键（钩子失效时的 Raw Input 兜底路径；钩子健康时 F5 已被吞）
         0x7C => 0x3E, // F13 → 语音键（vibe-flow 式 Scancode Map 变形后的形态，兼容保留）
         0x26 => 0x52, // ↑
-        0x25 => 0x51, // ←
-        0x27 => 0x53, // →
-        0x28 => 0x54, // ↓
-        0x0D => 0x58, // Return → OK
-        0x1B => 0x29, // Esc → Back
+        0x25 => 0x50, // ←
+        0x27 => 0x53, // →（物理键盘标准 usage 形态）
+        0xDB => 0x4F, // →（RC003 usage 0x4F 的 Windows VK 翻译形态）
+        0x28 => 0x51, // ↓
+        0x0D => 0x28, // Return → OK（usage 0x28）
+        0x1B => 0xF1, // Esc → Back（usage 0xF1）
+        0xFF => 0xF1, // 未知 usage（RC003 Back 的实测形态）→ Back
         0x24 => 0x4A, // Home
         0x5D => 0x65, // Application → Menu
         _ => 0,
@@ -234,19 +242,27 @@ public sealed class HidRemoteMonitor : IDisposable
     private void HandleUsages(HashSet<ushort> usages)
     {
         // 语音键 usage 0x3E：直接驱动语音会话；其原生 F5 事件由抑制器在会话期间持续吞掉（含 key-repeat）
-        var voiceDown = usages.Contains(VoiceKeyUsage);
-        var voiceWasDown = _activeUsages.Contains(VoiceKeyUsage);
-        if (voiceDown && !voiceWasDown)
+        try
         {
-            _app.OnRemoteVoiceKeyPressed();
-            AppLogger.Write("HID VOICEKEY down");
-        }
-        else if (!voiceDown && voiceWasDown)
-        {
-            _app.OnRemoteVoiceKeyReleased();
-        }
+            var voiceDown = usages.Contains(VoiceKeyUsage);
+            var voiceWasDown = _activeUsages.Contains(VoiceKeyUsage);
+            if (voiceDown && !voiceWasDown)
+            {
+                _app.OnRemoteVoiceKeyPressed();
+                AppLogger.Write("HID VOICEKEY down");
+            }
+            else if (!voiceDown && voiceWasDown)
+            {
+                _app.OnRemoteVoiceKeyReleased();
+            }
 
-        Process(usages);
+            Process(usages);
+        }
+        catch (Exception ex)
+        {
+            // Raw Input/手势回调线程内的异常若不接住会被消息循环吞掉，表现为按键静默失效
+            AppLogger.Write("HID BUTTON error usages=" + string.Join(",", usages) + " ex=" + ex.GetType().Name + ": " + ex.Message + " @" + ex.StackTrace?.Split('\n').FirstOrDefault()?.Trim());
+        }
     }
 
     private static string Truncate(string? s) =>
@@ -276,8 +292,10 @@ public sealed class HidRemoteMonitor : IDisposable
 
     private void HandleButtonPress(RemoteButton button)
     {
+        AppLogger.Write("HID BUTTON press button=" + button + " mapping=" + _settings.CustomMappingEnabled);
         if (AppSwitcherSession.Current?.IsActive == true && HandleAppSwitcherPress(button))
         {
+            AppLogger.Write("HID BUTTON consumed_by=appswitcher button=" + button);
             return;
         }
 
@@ -314,6 +332,7 @@ public sealed class HidRemoteMonitor : IDisposable
 
     private void HandleButtonRelease(RemoteButton button)
     {
+        AppLogger.Write("HID BUTTON release button=" + button + " mapping=" + _settings.CustomMappingEnabled);
         if (!_settings.CustomMappingEnabled)
         {
             return;
