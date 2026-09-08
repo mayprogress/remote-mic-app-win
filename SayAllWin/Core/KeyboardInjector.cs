@@ -20,23 +20,25 @@ public static class KeyboardInjector
     public const ushort VK_MEDIA_PREV = 0xB0, VK_MEDIA_NEXT = 0xB1, VK_MEDIA_PLAY_PAUSE = 0xB3;
 
     // WPF 没有解析这些键；SendInput 支持它们
-    // x64 INPUT = type(4) + pad(4) + union(32: MOUSEINPUT 28 对齐) = 40 字节；
-    // Size 写 32 会导致 SendInput 一律返回 0（vibe-flow 的 Sequential 布局自动为 40，实测可注入）。
+    // x64 INPUT 真实布局：type@0 + pad@4-7（union 含 8 字节对齐指针 → union 对齐 8）+ union@8；
+    // KEYBDINPUT: wVk@8 wScan@10 dwFlags@12 time@16 dwExtraInfo@20；MOUSEINPUT: dx@8 dy@12
+    // mouseData@16 dwFlags@20 time@24 dwExtraInfo@28；总 40 字节。
+    // 曾错写 wVk@4（落在 pad 区）：SendInput 读到 wVk=0 的空键事件，返回 1 但目标收不到。
     [StructLayout(LayoutKind.Explicit, Size = 40)]
     private struct NativeInput
     {
         [FieldOffset(0)] public uint type;
         // KEYBDINPUT
-        [FieldOffset(4)] public ushort wVk;
-        [FieldOffset(6)] public ushort wScan;
-        [FieldOffset(8)] public uint kbFlags;
-        [FieldOffset(12)] public uint time;
-        [FieldOffset(16)] public IntPtr dwExtraInfo;
+        [FieldOffset(8)] public ushort wVk;
+        [FieldOffset(10)] public ushort wScan;
+        [FieldOffset(12)] public uint kbFlags;
+        [FieldOffset(16)] public uint time;
+        [FieldOffset(20)] public IntPtr dwExtraInfo;
         // MOUSEINPUT
-        [FieldOffset(4)] public int mi_dx;
-        [FieldOffset(8)] public int mi_dy;
-        [FieldOffset(12)] public uint mi_mouseData;
-        [FieldOffset(16)] public uint mi_flags;
+        [FieldOffset(8)] public int mi_dx;
+        [FieldOffset(12)] public int mi_dy;
+        [FieldOffset(16)] public uint mi_mouseData;
+        [FieldOffset(20)] public uint mi_flags;
     }
 
     private const uint INPUT_KEYBOARD = 1;
