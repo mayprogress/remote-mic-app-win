@@ -64,33 +64,20 @@ public static class KeyboardInjector
     }
 
     /// <summary>
-    /// 扫描码层注入（对齐 vibe-flow 实测方案）：部分输入法（如微信输入法）不响应纯 VK 注入，
-    /// 需要以 KEYEVENTF_SCANCODE 携带 MapVirtualKey 换算的扫描码；换算失败时回退 VK 注入。
+    /// 语音键注入（对齐本机实测可行的形态）：同时携带 wVk 与 MapVirtualKey 换算的 wScan、
+    /// 不带 KEYEVENTF_SCANCODE——纯扫描码形态（wVk=0）会被微信输入法按 VK 匹配的钩子过滤；
+    /// VK+scan 双信息对 VK 层与扫描码层的消费者均可见（2026-09-08 独立注入实验验证可调起微信语音条）。
     /// </summary>
     public static bool PostKeyStateScan(ushort vk, bool isPressed)
     {
         var scan = MapVirtualKeyW(vk, 0 /* MAPVK_VK_TO_VSC */);
-        var flags = isPressed ? 0u : KEYEVENTF_KEYUP;
-        NativeInput input;
-        if (scan != 0)
+        var input = new NativeInput
         {
-            input = new NativeInput
-            {
-                type = INPUT_KEYBOARD,
-                wVk = 0,
-                wScan = (ushort)scan,
-                kbFlags = flags | KEYEVENTF_SCANCODE,
-            };
-        }
-        else
-        {
-            input = new NativeInput
-            {
-                type = INPUT_KEYBOARD,
-                wVk = vk,
-                kbFlags = flags,
-            };
-        }
+            type = INPUT_KEYBOARD,
+            wVk = vk,
+            wScan = (ushort)scan,
+            kbFlags = isPressed ? 0 : KEYEVENTF_KEYUP,
+        };
         return SendInput(1, [input], Marshal.SizeOf<NativeInput>()) == 1;
     }
 
