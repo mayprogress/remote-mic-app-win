@@ -12,6 +12,7 @@
 - **第四层根因（watcher 竞态）**：`HidDeviceWatcher` 随字段构造即开始轮询并缓存设备路径到 `_known`，`HidRemoteMonitor.Start()` 晚于首个发现事件订阅——发现事件在订阅前触发被丢弃，`_known` 已含路径后永不重发。
 - **第五层根因（接口路径偏移）**：`SetupDiGetDeviceInterfaceDetail` 的 `SP_DEVICE_INTERFACE_DETAIL_DATA.DevicePath`（wchar 数组）紧跟 `cbSize`（uint）位于 offset 4；原实现按指针大小读 offset 8，`CreateFile` 收到丢失 `\\?\` 前缀的路径报 123（ERROR_INVALID_NAME）。
 - **第六层根因（Windows 键盘独占）**：路径修正后 `CreateFile(GENERIC_READ)` 仍报 5（ERROR_ACCESS_DENIED）——Windows 对键盘类 HID collection 强制独占，用户态进程永远无法直接 ReadFile 键盘接口（与 macOS 需要 IOHIDManager seize 不同的系统边界）。
+- **第七层根因（拦截与识别互斥）**：LL 钩子吞掉的击键不会产生 Raw Input 事件——"钩子拦 F5"与"Raw Input 识别语音键"在同一通道上互斥；且实测修改 `KBDLLHOOKSTRUCT`（F5→F13 原地改写）**不影响系统处理**（LL 钩子只能吞或放，改写无效，浏览器照常刷新）。macOS 原版依赖 `IOHIDDeviceOpen(kIOHIDOptionsTypeSeizeDevice)` 设备级独占（系统键盘栈收不到该设备事件），Windows 无等价 API。
 
 ## 根因（按层）
 
@@ -20,16 +21,19 @@
 3. BLE `VID&012717` 格式不匹配 `VID_2717` 过滤；
 4. watcher 发现事件早于订阅且 `_known` 缓存导致事件被吞；
 5. DevicePath 读取偏移错误（+8 应为 +4）；
-6. Windows 键盘 HID collection 用户态独占，ReadFile 通道不可行，必须改用 Raw Input。
+6. Windows 键盘 HID collection 用户态独占，ReadFile 通道不可行，必须改用 Raw Input；
+7. LL 钩子吞键与 Raw Input 识别互斥、改写 KBDLLHOOKSTRUCT 无效，macOS 设备独占在 Windows 无用户态等价物——采用系统级 Scancode Map。
 
 ## 修复
 
 - `HidRemoteMonitor.Start()` 现在调用 `_suppressor.Start()` 并记录 `HID HOOK installed ok=<0|1>`；`Start()` 改为返回安装结果（钩子线程 TCS 等待 2 秒）。
 - **VID 双格式匹配**：`VID_2717 || VID&012717`，均要求 `32B8`。
 - **报告源切换 Raw Input**：新增 `RawInputListener`（`RegisterRawInputDevices` UsagePage=1/Usage=6 + `RIDEV_INPUTSINK`，message-only 窗口收 `WM_INPUT`，`GetRawInputData` 取 `RAWKEYBOARD`，`GetRawInputDeviceInfo(RIDI_DEVICENAME)` 缓存设备路径并按目标 VID/PID 过滤）。Windows 键盘事件唯一可编程通道即 Raw Input；`HidDeviceReader`（ReadFile 线程）保留但不再接线。`VkToUsage` 做 VK→HID usage 转换（F5↔0x3E 语音键、方向、Return=OK、Esc=Back、Home、Menu）；音量/电源等 consumer page 键不在 keyboard 通道内，保持系统直通。
-- **活跃期键位表硬拦截**：`NotifyRemoteReport()` 刷新活跃时间戳；LL 钩子对**非注入事件**且 VK 属于遥控器键位表（F5/方向/OK/Back/Home/Menu）且最近 30 秒有遥控器操作时一律吞掉（钩子线程内无 IO/日志，Interlocked 计数）。扩展自仅 F5 拦截：Raw Input 激活后程序开始执行按键动作，方向键等若不拦系统原生事件会产生"系统 + 注入"双份动作（macOS 的 seize 语义在 Windows 的等效实现）。对首 down 竞态、key-repeat、蓝牙延迟三条泄漏路径全部免疫。
-- 诊断日志：`HID POLL total= matched=`（设备总数变化时）、`HID DEVICE connected source=rawinput fingerprint=…`、`HID VOICEKEY down f5_total=<n>`、`RAWINPUT listener ok=<0|1>`。
-- 已知副作用：SayAll 运行且遥控器活跃（最近 30 秒有遥控器操作）期间，**物理键盘同键位（F5/方向/Return/Esc/Home/Menu）也被吞**；浏览器刷新可用 Ctrl+R 替代，遥控器闲置 30 秒后自动恢复。该取舍在 README 键位适配节注明。
+- **活跃期键位表拦截（已按用户要求撤销）**：方向/OK/Back/Home/Menu 不再锁定；F5 冲突改由 Scancode Map 系统级解决（见下）。`ShouldSuppress`（Arm 窗口）仅保留给自定义映射开启时的注入去重。
+- **Raw Input 通道实机确认（2026-09-08）**：按住语音键产生 `RAWINPUT vk=0x74 down=1 dev=\\?\HID#{00001812-…}`（30ms 间隔 key-repeat）→ `HID VOICEKEY down`，松开 `down=0`；物理键盘（VID_1A81）回车事件被 `not_target` 正确过滤。设备区分链路完全成立。
+- **Scancode Map 终案**：`HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout` 写入 `Scancode Map`（REG_BINARY，1 个映射对：scan 0x3E→0x64，即 F5→F13），**重启后生效**。系统键盘栈从底层收到的语音键就是 F13（无任何快捷键语义），Raw Input 收到同一事件且保留真实设备标识：遥控器 F13 → 语音键（`VkToUsage(0x7C)=0x3E`），物理键盘 F5（变形后的 F13）→ 设备过滤忽略。方向/OK/Back/Home/Menu 等其他按键完全不受影响。写入由设置页/引导提权完成（一次性 UAC），删除该注册表值并重启即可还原。
+- **代价（用户已确认接受"只锁定 F5"）**：物理键盘 F5 全局失效（所有键盘的 F5 都变形为 F13），浏览器刷新用 Ctrl+R 替代；重启前过渡期 F5 仍会触发刷新。
+- 诊断日志：`HID POLL total= matched=`（设备总数变化时）、`RAWINPUT vk= down= dev=`（关注键位）、`HID DEVICE connected source=rawinput fingerprint=…`、`HID VOICEKEY down`、`RAWINPUT listener ok=<0|1>`。
 
 ## 验证
 

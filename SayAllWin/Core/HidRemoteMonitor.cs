@@ -174,10 +174,12 @@ public sealed class HidRemoteMonitor : IDisposable
         _monitoring = false;
     }
 
-    /// <summary>键盘 VK → HID 键盘 usage（仅覆盖遥控器 keyboard page 按键；音量/电源等 consumer page 键不在 Raw Input keyboard 通道内）。</summary>
+    /// <summary>键盘 VK → HID 键盘 usage（仅覆盖遥控器 keyboard page 按键；音量/电源等 consumer page 键不在 Raw Input keyboard 通道内）。
+    /// 0x7C(F13) 是 LL 钩子把遥控器语音键原生 F5 原地改写后的键，保留真实设备标识，Raw Input 据此驱动语音键。</summary>
     private static ushort VkToUsage(ushort vk) => vk switch
     {
-        0x74 => 0x3E, // F5 → 语音键
+        0x74 => 0x3E, // F5 → 语音键（未被钩子改写的路径）
+        0x7C => 0x3E, // F13 → 语音键（钩子改写后的遥控器语音键信号）
         0x26 => 0x52, // ↑
         0x25 => 0x51, // ←
         0x27 => 0x53, // →
@@ -221,13 +223,11 @@ public sealed class HidRemoteMonitor : IDisposable
         if (voiceDown && !voiceWasDown)
         {
             _app.OnRemoteVoiceKeyPressed();
-            ArmSuppression(0x74 /* VK_F5 */, true, sticky: true);
-            AppLogger.Write("HID VOICEKEY down f5_total=" + _suppressor.F5SwallowCount);
+            AppLogger.Write("HID VOICEKEY down");
         }
         else if (!voiceDown && voiceWasDown)
         {
             _app.OnRemoteVoiceKeyReleased();
-            ArmSuppression(0x74, false);
         }
 
         Process(usages);
@@ -265,6 +265,13 @@ public sealed class HidRemoteMonitor : IDisposable
             return;
         }
 
+        // 未开自定义映射：不注入任何动作，系统原生按键（Raw Input 与系统事件同源于同一物理按键）单份生效；
+        // macOS 的 seize 语义在此平台不适用（无设备级独占，注入会导致双份动作）。
+        if (!_settings.CustomMappingEnabled)
+        {
+            return;
+        }
+
         var doubleClick = _settings.GetConfiguredAction(button, ButtonTrigger.DoubleClick).Action != ButtonAction.Disabled;
         var longPress = _settings.GetConfiguredAction(button, ButtonTrigger.LongPress).Action != ButtonAction.Disabled;
         var action = _settings.GetConfiguredAction(button, ButtonTrigger.SingleClick).Action;
@@ -291,6 +298,10 @@ public sealed class HidRemoteMonitor : IDisposable
 
     private void HandleButtonRelease(RemoteButton button)
     {
+        if (!_settings.CustomMappingEnabled)
+        {
+            return;
+        }
         CancelRepeat(button);
         if (_settings.CustomMappingEnabled)
         {

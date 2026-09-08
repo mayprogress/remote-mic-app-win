@@ -36,7 +36,7 @@
    - 预期：状态推进为「正在连接 → 正在初始化语音通道 → 已连接（设备名）」，显示电量；日志出现 `BLE CONNECTING source=paired_device`、`BLE CONNECTED`、`BATTERY level=<n>`、`MODEL identified=Rc003`、`ATVV CAPS`、`BLE READY`。
    - 失败判定：30 秒后仍无连接且日志出现连续 `BLE CONNECT FAILED`，或 `voice_channel_discovery_failed` 连续 3 次以上不恢复（偶发 1 次后由重连策略自动恢复属正常）。
    - 2026-09-07 真机验收（RC003 / Windows 11）：连接、服务发现、电量 99%、型号识别、ATVV 能力协商（version=256 codec=2 frame=120 16kHz）、UI 绿点"已连接"全部通过；修复记录见 `Bugs/2026-09-07-windows-ble-paired-flag-filter.md`。语音闭环仍待用户实测（用例 4）。
-   - 注入键说明：语音键注入 **F13**（0x7C），或选「微信输入法按住说话」模式注入 Ctrl+Win；遥控器 keyboard 键位（F5/方向/OK/Back/Home/Menu）的原生事件由低级键盘钩子在遥控器活跃期（最近 30 秒内有遥控器操作）硬拦截（对应 macOS 设备独占语义），同期物理键盘同键位也被吞（浏览器刷新用 Ctrl+R 替代），闲置 30 秒后恢复。音量/电源/TV 等 consumer page 键不在 Raw Input 键盘通道内，保持系统直通。Windows 对键盘 HID collection 强制独占（ReadFile 报拒绝访问），按键报告源为 **Raw Input**（RIDEV_INPUTSINK）而非 ReadFile。修复记录见 `Bugs/2026-09-07-windows-voice-key-f5-repeat-leak.md`。使用方语音工具需把触发键设为 F13（微信输入法用 Ctrl+Win 模式）。
+   - 注入键说明：语音键注入 **F13**（0x7C），或选「微信输入法按住说话」模式注入 Ctrl+Win。**F5 冲突由系统级 Scancode Map 解决**：注册表 `HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout\Scancode Map` 把 F5 扫描码（0x3E）映射为 F13（0x64），**重启后生效**——遥控器语音键从系统底层就是 F13，任何应用不再收到 F5；物理键盘 F5 同样变形为 F13（失效，刷新用 Ctrl+R 替代）；方向/OK/Back/Home/Menu 等其他按键不受影响。按键报告源为 **Raw Input**（RIDEV_INPUTSINK，Windows 键盘 HID collection 拒绝用户态 ReadFile），按设备路径区分遥控器与物理键盘。修复记录见 `Bugs/2026-09-07-windows-voice-key-f5-repeat-leak.md`。使用方语音工具需把触发键设为 F13（微信输入法用 Ctrl+Win 模式）。
 3. 关闭遥控器电源等待 30 秒再开机。
    - 预期：应用自动重连（指数退避 3s 起步）；日志出现 `BLE RECONNECT scheduled`。
 4. 系统睡眠唤醒。

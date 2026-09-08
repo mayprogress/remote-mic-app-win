@@ -309,18 +309,13 @@ public sealed class KeyboardEventSuppressor : IDisposable
                 var data = Marshal.PtrToStructure<HidNative.KBDLLHOOKSTRUCT>(lParam);
                 if ((data.flags & HidNative.LLKHF_INJECTED) == 0)
                 {
-                    var vk = (ushort)data.vkCode;
-                    // 遥控器活跃期：遥控器 keyboard 键位表内的原生事件一律吞掉（含首 down 竞态与 key-repeat），
-                    // 程序动作是唯一来源（对应 macOS 设备独占语义）。钩子线程内无 IO/日志，仅计数。
-                    // 副作用：活跃期（最近 30 秒内有遥控器操作）物理键盘同键位被吞，闲置 30 秒后恢复。
-                    if (IsRemoteControlledVk(vk) && Environment.TickCount64 - _lastReportTickCount <= RemoteActiveWindowMs)
+                    // 实测结论：LL 钩子只能吞掉或放行事件，修改 KBDLLHOOKSTRUCT 不影响系统处理（改写 F5→F13 无效已验证）。
+                    // F5 的系统级消除由 Scancode Map（HKLM …\Keyboard Layout，scan 0x3E→0x64=F13，重启生效）完成：
+                    // 系统从底层收到的就是 F13，Raw Input 收到同一事件且保留真实来源设备标识，
+                    // 按键映射按设备路径区分遥控器（→语音键）与物理键盘（→忽略）。
+                    // 该钩子仅保留 Arm 窗口抑制（自定义映射场景的注入去重）。
+                    if (ShouldSuppress((ushort)data.vkCode, message))
                     {
-                        Interlocked.Increment(ref _f5SwallowCount);
-                        return new IntPtr(1);
-                    }
-                    if (ShouldSuppress(vk, message))
-                    {
-                        // 吞掉该事件，避免与注入动作重复
                         return new IntPtr(1);
                     }
                 }
@@ -328,18 +323,6 @@ public sealed class KeyboardEventSuppressor : IDisposable
         }
         return HidNative.CallNextHookEx(_hook, nCode, wParam, lParam);
     }
-
-    /// <summary>遥控器 keyboard page 键位对应的 VK（语音键 F5、方向、OK、Back、Home、Menu）。音量/电源等 consumer page 键不在 Raw Input 通道内，无需拦截。</summary>
-    private static bool IsRemoteControlledVk(ushort vk) => vk switch
-    {
-        0x74 /* F5 语音键 */ => true,
-        0x25 or 0x26 or 0x27 or 0x28 /* ← ↑ → ↓ */ => true,
-        0x0D /* Return=OK */ => true,
-        0x1B /* Esc=Back */ => true,
-        0x24 /* Home */ => true,
-        0x5D /* Application=Menu */ => true,
-        _ => false,
-    };
 
     private bool ShouldSuppress(ushort vk, int message)
     {
@@ -564,8 +547,23 @@ public sealed class RawInputListener : IDisposable
             var down = (k.Flags & 0x01) == 0; // RI_KEY_BREAK
             var vk = k.VKey;
             if (vk == 0) return;
+            // 诊断：关注键位（遥控器键位+F13）与未知设备，节流记录；物理键盘常规输入不记。
+            var watched = vk is 0x74 or 0x7C or 0x25 or 0x26 or 0x27 or 0x28 or 0x0D or 0x1B or 0x24 or 0x5D;
             var name = DeviceNameFor(raw.header.hDevice);
-            if (name is null || !HidNative.IsTargetDevicePath(name)) return;
+            if (watched)
+            {
+                AppLogger.Write("RAWINPUT vk=0x" + vk.ToString("X2") + " down=" + (down ? "1" : "0")
+                    + " dev=" + (name is null ? "none" : TruncateDev(name)));
+            }
+            if (name is null || !HidNative.IsTargetDevicePath(name))
+            {
+                if (watched)
+                {
+                    AppLogger.Write("RAWINPUT dropped vk=0x" + vk.ToString("X2")
+                        + " reason=" + (name is null ? "no_device" : "not_target"));
+                }
+                return;
+            }
             DeviceKey?.Invoke(name, vk, down);
         }
         finally
@@ -573,6 +571,8 @@ public sealed class RawInputListener : IDisposable
             Marshal.FreeHGlobal(buf);
         }
     }
+
+    private static string TruncateDev(string s) => s.Length > 40 ? s[..40] + "…" : s;
 
     private string? DeviceNameFor(IntPtr hDevice)
     {
