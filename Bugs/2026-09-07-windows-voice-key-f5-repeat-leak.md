@@ -32,6 +32,7 @@
 - **活跃期键位表拦截（已按用户要求撤销）**：方向/OK/Back/Home/Menu 不再锁定；F5 冲突改由 Scancode Map 系统级解决（见下）。`ShouldSuppress`（Arm 窗口）仅保留给自定义映射开启时的注入去重。
 - **Raw Input 通道实机确认（2026-09-08）**：按住语音键产生 `RAWINPUT vk=0x74 down=1 dev=\\?\HID#{00001812-…}`（30ms 间隔 key-repeat）→ `HID VOICEKEY down`，松开 `down=0`；物理键盘（VID_1A81）回车事件被 `not_target` 正确过滤。设备区分链路完全成立。
 - **Scancode Map 尝试（已撤销）**：曾写入 scan 0x3E→0x64，实机验证未生效——0x3E 是 F4 的 set 1 扫描码（F5 应为 0x3F，vibe-flow 源码确认），且 BLE HID 重连会出现扫描码漂移/缺失，该机制对 RC003 不可靠；错误映射已从注册表删除。
+- **注入层隐性失败（SendInput 结构尺寸）**：`NativeInput` 显式布局 `Size=32`——x64 的 INPUT 实际为 40 字节（type 4 + pad 4 + union 32，MOUSEINPUT 28 字节对齐所致；vibe-flow 用 Sequential 布局自动为 40）。尺寸不符使 **SendInput 一律返回 0**，从第一版起所有键盘/滚轮注入都未真正投递过（Fn 模式下浏览器本就不响应 F13，返回值无人检查，故长期未暴露）。修复为 `Size=40` 后由 `INJECT voice ... ok=` 日志验证。此为第八层根因。
 - **最终方案（对齐本机 vibe-flow 实测架构）**：LL 钩子吞掉 F5（VK 0x74，不依赖扫描码）阻止系统快捷键效果，钩子线程内仅投递（线程池），池线程驱动语音状态机；Raw Input（设备过滤后）作为第二来源调用同一 `_rawActive`/`HandleUsages` 幂等状态机，重复边沿由 voiceWasDown 保护去重（钩子健康时事件被吞、Raw Input 收不到，天然单源；钩子失效时 Raw Input 兜底）。物理键盘 F5 因此失效（Ctrl+R 替代刷新），方向/OK/Back/Home/Menu 不吞、由设备域 Raw Input 执行。注入改用扫描码层（`KEYEVENTF_SCANCODE` + `MapVirtualKey`，对齐 vibe-flow `useScanCode=true`）：部分输入法（微信输入法）不响应纯 VK 注入。
 - 诊断日志：`HID POLL total= matched=`（设备总数变化时）、`RAWINPUT vk= down= dev=`（关注键位）、`HID DEVICE connected source=rawinput fingerprint=…`、`HID VOICEKEY down`、`RAWINPUT listener ok=<0|1>`。
 

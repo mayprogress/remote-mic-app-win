@@ -20,7 +20,9 @@ public static class KeyboardInjector
     public const ushort VK_MEDIA_PREV = 0xB0, VK_MEDIA_NEXT = 0xB1, VK_MEDIA_PLAY_PAUSE = 0xB3;
 
     // WPF 没有解析这些键；SendInput 支持它们
-    [StructLayout(LayoutKind.Explicit, Size = 32)]
+    // x64 INPUT = type(4) + pad(4) + union(32: MOUSEINPUT 28 对齐) = 40 字节；
+    // Size 写 32 会导致 SendInput 一律返回 0（vibe-flow 的 Sequential 布局自动为 40，实测可注入）。
+    [StructLayout(LayoutKind.Explicit, Size = 40)]
     private struct NativeInput
     {
         [FieldOffset(0)] public uint type;
