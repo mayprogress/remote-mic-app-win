@@ -418,7 +418,8 @@ public sealed class XiaomiBluetoothBridge
         }
         catch (Exception ex)
         {
-            AppLogger.Write("BLE INIT error=" + ex.Message);
+            AppLogger.Write("BLE INIT error=" + ex.GetType().Name + ": " + ex.Message);
+            AppLogger.Write("BLE INIT stack=" + ex.StackTrace?.Replace("\r\n", " | "));
             FailInitialization("voice_service_discovery_failed");
         }
     }

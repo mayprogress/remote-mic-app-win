@@ -36,7 +36,7 @@
    - 预期：状态推进为「正在连接 → 正在初始化语音通道 → 已连接（设备名）」，显示电量；日志出现 `BLE CONNECTING source=paired_device`、`BLE CONNECTED`、`BATTERY level=<n>`、`MODEL identified=Rc003`、`ATVV CAPS`、`BLE READY`。
    - 失败判定：30 秒后仍无连接且日志出现连续 `BLE CONNECT FAILED`，或 `voice_channel_discovery_failed` 连续 3 次以上不恢复（偶发 1 次后由重连策略自动恢复属正常）。
    - 2026-09-07 真机验收（RC003 / Windows 11）：连接、服务发现、电量 99%、型号识别、ATVV 能力协商（version=256 codec=2 frame=120 16kHz）、UI 绿点"已连接"全部通过；修复记录见 `Bugs/2026-09-07-windows-ble-paired-flag-filter.md`。语音闭环仍待用户实测（用例 4）。
-   - 注入键说明：语音键注入 **F13**（0x7C），或选「微信输入法按住说话」模式注入 Ctrl+Win（**扫描码层注入**，`KEYEVENTF_SCANCODE`+`MapVirtualKey`——部分输入法不响应纯 VK 注入）。**F5 冲突由 LL 钩子全局吞掉解决**（对齐 vibe-flow 实测架构）：钩子吞 F5（VK 0x74）并经线程池投递语音边沿，Raw Input（设备过滤）为第二来源，共用幂等状态机去重；物理键盘 F5 同样被吞（失效，刷新用 Ctrl+R 替代）；方向/OK/Back/Home/Menu 不吞，由设备域 Raw Input 执行。按键报告源为 **Raw Input**（RIDEV_INPUTSINK，Windows 键盘 HID collection 拒绝用户态 ReadFile）。修复记录见 `Bugs/2026-09-07-windows-voice-key-f5-repeat-leak.md`。使用方语音工具需把触发键设为 F13（微信输入法用 Ctrl+Win 模式）。
+   - 注入键说明：语音键注入 **F13**（0x7C），或选「微信输入法按住说话」模式注入 Ctrl+Win（**VK+扫描码双信息**，`wVk`+`MapVirtualKey` 的 `wScan`——纯扫描码形态（wVk=0）会被微信输入法按 VK 匹配的钩子过滤）。**F5 冲突由 LL 钩子全局吞掉解决**（对齐 vibe-flow 实测架构）：钩子吞 F5（VK 0x74）并经线程池投递语音边沿，Raw Input（设备过滤）为第二来源，共用幂等状态机去重；物理键盘 F5 同样被吞（失效，刷新用 Ctrl+R 替代）；方向/OK/Back/Home/Menu 不吞，由设备域 Raw Input 执行。按键报告源为 **Raw Input**（RIDEV_INPUTSINK，Windows 键盘 HID collection 拒绝用户态 ReadFile）。修复记录见 `Bugs/2026-09-07-windows-voice-key-f5-repeat-leak.md`。**2026-09-08 真机已验收**：按住语音键无 F5 刷新、微信输入法语音条弹出并出字。使用方语音工具需把触发键设为 F13（微信输入法用 Ctrl+Win 模式）。
 3. 关闭遥控器电源等待 30 秒再开机。
    - 预期：应用自动重连（指数退避 3s 起步）；日志出现 `BLE RECONNECT scheduled`。
 4. 系统睡眠唤醒。
